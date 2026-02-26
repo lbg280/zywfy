@@ -1,13 +1,12 @@
 import base64
 import hashlib
-import json
 import os
 import time
-from typing import Dict
+from typing import Dict, Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 load_dotenv()
@@ -53,6 +52,13 @@ class TokenCache:
 
 
 token_cache = TokenCache()
+
+
+def validate_wav(wav_bytes: bytes) -> None:
+    if len(wav_bytes) < 44:
+        raise HTTPException(status_code=400, detail="WAV too short")
+    if wav_bytes[0:4] != b"RIFF" or wav_bytes[8:12] != b"WAVE":
+        raise HTTPException(status_code=400, detail="Invalid WAV header, expected RIFF/WAVE")
 
 
 async def baidu_asr(wav_bytes: bytes) -> str:
@@ -132,11 +138,10 @@ async def baidu_tts(text: str) -> bytes:
     return resp.content
 
 
-@app.post("/translate_audio")
-async def translate_audio(file: UploadFile = File(...)):
-    wav_bytes = await file.read()
+async def process_wav(wav_bytes: bytes) -> JSONResponse:
     if not wav_bytes:
         raise HTTPException(status_code=400, detail="empty audio")
+    validate_wav(wav_bytes)
 
     zh_text = await baidu_asr(wav_bytes)
     en_text = await deepseek_translate_zh_to_en(zh_text)
@@ -154,6 +159,21 @@ async def translate_audio(file: UploadFile = File(...)):
             "tts_format": "mp3",
         }
     )
+
+
+@app.post("/translate_audio")
+async def translate_audio(request: Request, file: Optional[UploadFile] = File(default=None)):
+    if file is not None:
+        wav_bytes = await file.read()
+    else:
+        wav_bytes = await request.body()
+    return await process_wav(wav_bytes)
+
+
+@app.post("/translate_audio_raw")
+async def translate_audio_raw(request: Request):
+    wav_bytes = await request.body()
+    return await process_wav(wav_bytes)
 
 
 @app.get("/health")

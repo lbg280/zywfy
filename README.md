@@ -1,20 +1,21 @@
-# xiaozhi-esp32-c3 中英文实时翻译（百度语音 + DeepSeek）
+# xiaozhi-esp32-c3 中英文翻译（百度语音 + DeepSeek）
 
-这是一个可直接落地的完整示例：
-- 设备端：`xiaozhi-esp32-c3`（Arduino / PlatformIO）
+这版是可直接跑在开发板上的“按键录音 -> 中文识别 -> 英文翻译”完整实现，修复了之前示例里占位 WAV 导致无法实机使用的问题。
+
+- 开发板：ESP32-C3（PlatformIO / Arduino）
 - 语音识别：百度 ASR
-- 文本翻译：DeepSeek 大模型
-- （可选）英文语音合成：百度 TTS
+- 翻译：DeepSeek
+- 英文语音：百度 TTS（后端返回 base64 mp3，可选接播放）
 
-> 当前工程分为两部分：
-> 1. `server/`：Python 后端，负责百度 ASR + DeepSeek 翻译 + 百度 TTS。
-> 2. `firmware/`：ESP32-C3 端，上传 WAV 录音并接收翻译结果。
+## 目录
+- `server/`: Python 后端
+- `firmware/`: ESP32-C3 固件
 
 ---
 
-## 1. 后端部署（必须先完成）
+## 1) 后端部署
 
-### 1.1 准备环境
+### 1.1 安装依赖
 ```bash
 cd server
 python3 -m venv .venv
@@ -24,40 +25,34 @@ pip install -r requirements.txt
 
 ### 1.2 配置密钥
 ```bash
-cp ../.env.example ../.env
-# 编辑 .env，填入 DeepSeek 和百度语音密钥
-```
-
-`.env` 示例：
-```env
-DEEPSEEK_API_KEY=sk-xxxx
-DEEPSEEK_MODEL=deepseek-chat
-BAIDU_API_KEY=xxxx
-BAIDU_SECRET_KEY=xxxx
-HOST=0.0.0.0
-PORT=8000
-```
-
-### 1.3 启动服务
-```bash
 cd ..
+cp .env.example .env
+# 编辑 .env 填入密钥
+```
+
+### 1.3 启动
+```bash
 source server/.venv/bin/activate
 uvicorn server.app:app --host 0.0.0.0 --port 8000
 ```
 
-接口：
+### 1.4 接口
 - `GET /health`
-- `POST /translate_audio`（form-data 文件字段名：`file`，WAV）
+- `POST /translate_audio`：支持 multipart 上传（字段名 `file`）或直接 body 上传 wav
+- `POST /translate_audio_raw`：直接 body 上传 wav（固件默认使用）
 
 ---
 
-## 2. ESP32-C3 固件
+## 2) 固件使用
 
-### 2.1 修改配置
+### 2.1 修改配置（必须）
 编辑 `firmware/src/main.cpp`：
-- `WIFI_SSID`
-- `WIFI_PASS`
-- `SERVER_HOST`（改成你电脑/服务器在局域网的 IP）
+- `WIFI_SSID`, `WIFI_PASS`
+- `SERVER_URL`（改成你的后端地址，如 `http://192.168.1.100:8000/translate_audio_raw`）
+- I2S 引脚：`I2S_BCLK`, `I2S_WS`, `I2S_DIN`
+- 按键引脚：`BUTTON_PIN`
+
+> 当前按键逻辑使用 `INPUT_PULLUP`，即按下为 LOW。
 
 ### 2.2 编译烧录
 ```bash
@@ -66,25 +61,35 @@ pio run -t upload
 pio device monitor
 ```
 
-### 2.3 录音逻辑说明
-`main.cpp` 里保留了 `SAMPLE_WAV` 占位数据，**你需要替换成 I2S 麦克风录音结果**，要求：
-- 格式：WAV
-- 采样率：16k
-- 单声道
-- 16bit
-
-你可以把你已有的 xiaozhi-esp32-c3 录音函数接入到 `postAudioAndGetEnglish(...)` 调用前。
+### 2.3 使用方式
+1. 串口看到 `[READY] hold button to record and translate`
+2. 按住按键说中文
+3. 松开按键后自动上传并翻译
+4. 串口输出：
+   - `[ASR] zh: ...`
+   - `[NMT] en: ...`
 
 ---
 
-## 3. 请求与返回格式
+## 3) 解决你反馈的重启问题
 
-### 请求
-`POST /translate_audio`
-- `multipart/form-data`
-- 字段：`file`（audio.wav）
+你提供的日志是持续 `RTC_SW_SYS_RST` 重启。这个版本避免了旧示例中的高风险点：
 
-### 返回 JSON
+- 去掉占位假 WAV 自动上传逻辑，改成“按键触发真实录音”
+- 使用 I2S 实时采集，构造标准 WAV 头
+- 网络请求放在明确流程里，并加入超时
+- 启动阶段仅初始化，不做危险的无效请求
+
+如果仍重启，请优先检查：
+- 板型是否正确（`esp32-c3-devkitm-1`）
+- USB 供电是否稳定
+- I2S 引脚是否与实际硬件一致
+- 按键引脚是否冲突启动脚
+
+---
+
+## 4) 返回格式
+
 ```json
 {
   "zh_text": "今天天气真好",
@@ -97,16 +102,7 @@ pio device monitor
 
 ---
 
-## 4. 常见问题
-
-1. **ASR 失败**：请确认上传的是标准 WAV（16k/16bit/mono）。
-2. **DeepSeek 报错**：确认 API Key 与模型名可用。
-3. **ESP32 连接失败**：确认 `SERVER_HOST` 可被开发板访问。
-4. **想要播报英文**：可在 ESP32 端把 `tts_audio_base64` 解码后送到音频播放链路（I2S DAC/功放）。
-
----
-
-## 5. 后续可扩展
-- 按键按下开始录音、松开结束并上传
-- WebSocket 流式识别 + 流式翻译
-- 本地 VAD 降噪（减少无效上传）
+## 5) 可继续扩展
+- 把 `tts_audio_base64` 在设备端解码后播放
+- 加入 VAD 降噪
+- 改 WebSocket 流式识别/翻译
